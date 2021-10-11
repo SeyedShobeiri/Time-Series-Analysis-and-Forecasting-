@@ -9,6 +9,10 @@ import statsmodels.tsa.api as tsa
 import pandas as pd
 from sklearn.metrics import mean_squared_error
 from statsmodels.tsa.arima_model import ARMA
+from itertools import product
+from tqdm import tqdm
+import warnings
+from arch import arch_model as am
 
 def plot_correlogram(x, lags=None, title=None):
     lags = min(10, int(len(x)/5)) if lags is None else lags
@@ -85,3 +89,82 @@ def optimal_ARMA_lags(train_size,up_bound_p,up_bound_q,y):
     arma_results.index.names = ['p', 'q']
     
     return arma_results
+
+
+def optimal_sarimax_lags(train_size,y):
+    
+    l3 = list(range(2))
+    l4 = list(range(3))
+    params = [t for t in product(l4, l4, l3, l3) if t[0] > 0 and t[1] >  0]
+    
+    results = {}
+    test_set = y.iloc[train_size:]
+    for p1, q1, p2, q2 in tqdm(params):
+        preds = test_set.copy().to_frame('y_true').assign(y_pred=np.nan)
+        aic, bic = [], []
+        if p1 == 0 and q1 == 0:
+            continue
+        print('SARIMAX({},{},{},{}) is being tested'.format(p1,q1,p2,q2))
+        convergence_error = stationarity_error = 0
+        y_pred = []
+        for i, T in enumerate(range(train_size, len(y))):
+            train_set = y.iloc[T-train_size:T]
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore")
+                    model = tsa.SARIMAX(endog=train_set.values,
+                                    order=(p1, 0, q1),
+                                    seasonal_order=(p2, 0, q2, 12)).fit(disp=0)
+            except LinAlgError:
+                convergence_error += 1
+            except ValueError:
+                stationarity_error += 1
+
+            preds.iloc[i, 1] = model.forecast(steps=1)[0]
+            aic.append(model.aic)
+            bic.append(model.bic)
+
+        preds.dropna(inplace=True)
+        mse = mean_squared_error(preds.y_true, preds.y_pred)
+        results[(p1, q1, p2, q2)] = [np.sqrt(mse),
+                                          preds.y_true.sub(preds.y_pred).pow(2).std(),
+                                          np.mean(aic),
+                                          np.std(aic),                                                  
+                                          np.mean(bic),
+                                          np.std(bic),                                                  
+                                          convergence_error,
+                                          stationarity_error]
+    
+        sarimax_results = pd.DataFrame(results).T
+        sarimax_results.columns = ['RMSE', 'RMSE_std', 'AIC', 'AIC_std', 'BIC', 'BIC_std', 'convergence', 'stationarity']
+        sarimax_results['CV'] = sarimax_results.RMSE_std.div(sarimax_results.RMSE)
+        sarimax_results.index.names = ['p1', 'q1', 'p2', 'q2']
+    
+    return sarimax_results
+
+
+def optimal_GARCH(num_year,ret_data,up_bound_p,up_bound_q):
+    trainsize = num_year * 252
+    data = ret_data.clip(lower=ret_data.quantile(0.05),upper=ret_data.quantile(0.95))
+    T = len(data)
+    results = {}
+    for p in range(1, up_bound_p):
+        for q in range(1, up_bound_q):
+            print(f'{p} | {q}')
+            result = []
+            for s, t in enumerate(range(trainsize, T-1)):
+                train_set = data.iloc[s: t]
+                test_set = data.iloc[t+1]  # 1-step ahead forecast
+                model = am(y=train_set, p=p, q=q).fit(disp='off')
+                forecast = model.forecast(horizon=1)
+                mu = forecast.mean.iloc[-1, 0]
+                var = forecast.variance.iloc[-1, 0]
+                result.append([(test_set-mu)**2, var])
+            df = pd.DataFrame(result, columns=['y_true', 'y_pred'])
+            results[(p, q)] = np.sqrt(mean_squared_error(df.y_true, df.y_pred))
+            
+    return results
+
+
+def unit_root_test(df):
+    return df.apply(lambda x: f'{pd.Series(adfuller(x)).iloc[1]:.2%}').to_frame('p-value')
